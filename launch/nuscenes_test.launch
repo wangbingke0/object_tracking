@@ -1,0 +1,29 @@
+<launch>
+    <!-- nuScenes IMM-UKF-JPDA Tracking Test -->
+
+    <!-- Path to preprocessed nuScenes scene file -->
+    <arg name="data_file" default="$(find object_tracking)/nuscenes_preprocessed/scene-0061.txt"/>
+
+    <!-- Output tracking results file -->
+    <arg name="result_file" default="$(find object_tracking)/nuscenes_preprocessed/tracking_results.txt"/>
+
+    <!-- Playback rate in Hz (nuScenes keyframes are at 2 Hz) -->
+    <arg name="playback_rate" default="2.0"/>
+
+    <!-- Path to nuScenes dataset root (for loading raw sensor data) -->
+    <arg name="nuscenes_dataroot" default="$(find object_tracking)/v1.0-mini"/>
+
+    <!-- Whether to launch RViz -->
+    <arg name="viz" default="true"/>
+
+    <node name="nuscenes_tracking" pkg="object_tracking" type="nuscenes_tracking" output="screen">
+        <param name="data_file"          value="$(arg data_file)"/>
+        <param name="result_file"        value="$(arg result_file)"/>
+        <param name="playback_rate"      value="$(arg playback_rate)"/>
+        <param name="nuscenes_dataroot"  value="$(arg nuscenes_dataroot)"/>
+    </node>
+
+    <!-- RViz with pre-configured display -->
+    <node if="$(arg viz)" name="rviz" pkg="rviz" type="rviz"
+          args="-d $(find object_tracking)/rviz/nuscenes.rviz"/>
+</launch>
