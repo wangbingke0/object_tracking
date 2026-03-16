@@ -1,0 +1,177 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Value: true
+      Cell Size: 10
+      Color: 100; 100; 100
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 50
+      Reference Frame: ego_vehicle
+
+    - Class: rviz/TF
+      Enabled: false
+      Name: TF
+      Value: true
+
+    - Class: rviz/PointCloud2
+      Enabled: true
+      Name: LiDAR
+      Topic: /nuscenes/lidar
+      Queue Size: 1
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: Intensity
+      Use Fixed Frame: true
+      Decay Time: 0
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
+      Name: TrackingMarkers
+      Marker Topic: /visualization_marker
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
+      Name: LaneMarkers
+      Marker Topic: /visualization_marker_lane
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
+      Name: BoxMarkers
+      Marker Topic: /visualization_marker_boxes
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
+      Name: HUDMarkers
+      Marker Topic: /visualization_marker_hud
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
+      Name: ArrowMarkers
+      Marker Topic: /visualization_marker2
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: TrackLabels
+      Marker Topic: /track_labels
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Image
+      Enabled: true
+      Name: CAM_FRONT
+      Image Topic: /nuscenes/cam_front
+      Queue Size: 1
+      Transport Hint: raw
+      Value: true
+
+    - Class: rviz/Image
+      Enabled: true
+      Name: CAM_FRONT_LEFT
+      Image Topic: /nuscenes/cam_front_left
+      Queue Size: 1
+      Transport Hint: raw
+      Value: true
+
+    - Class: rviz/Image
+      Enabled: true
+      Name: CAM_FRONT_RIGHT
+      Image Topic: /nuscenes/cam_front_right
+      Queue Size: 1
+      Transport Hint: raw
+      Value: true
+
+    - Class: rviz/Image
+      Enabled: false
+      Name: CAM_BACK
+      Image Topic: /nuscenes/cam_back
+      Queue Size: 1
+      Transport Hint: raw
+      Value: true
+
+    - Class: rviz/Image
+      Enabled: false
+      Name: CAM_BACK_LEFT
+      Image Topic: /nuscenes/cam_back_left
+      Queue Size: 1
+      Transport Hint: raw
+      Value: true
+
+    - Class: rviz/Image
+      Enabled: false
+      Name: CAM_BACK_RIGHT
+      Image Topic: /nuscenes/cam_back_right
+      Queue Size: 1
+      Transport Hint: raw
+      Value: true
+
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: ego_vehicle
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+  Toolbars:
+    toolButtonStyle: 2
+  Value: true
+  Views:
+    Current:
+      Class: rviz/TopDownOrtho
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Scale: 10
+      Target Frame: ego_vehicle
+      Value: TopDownOrtho (rviz)
+      X: 0
+      Y: 0
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1200
+  Views:
+    collapsed: false

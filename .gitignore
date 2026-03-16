@@ -1,0 +1,13 @@
+build/
+*.log
+*.pcd
+*.bin
+*.bag
+*.pyc
+__pycache__/
+.vscode/
+v1.0-*/
+backup/
+pic/
+file/
+
