@@ -25,8 +25,10 @@
 #include <iomanip>
 #include <mutex>
 #include <array>
+#include <unordered_set>
 
 #include "imm_ukf_jpda.h"
+#include "trajectory_predictor.h"
 
 using namespace std;
 using namespace pcl;
@@ -44,6 +46,51 @@ void playbackRateCallback(const std_msgs::Float64::ConstPtr& msg)
     ROS_INFO("Playback rate changed to %.2f Hz", g_playback_rate);
 }
 
+void computeLaneYawAndKappa(LanePolyline& lane)
+{
+    const size_t n = lane.points.size();
+    if (n < 2) return;
+
+    // 1) tangent yaw for each point
+    for (size_t i = 0; i < n; i++) {
+        double dx = 0.0, dy = 0.0;
+        if (i == 0) {
+            dx = lane.points[1].x - lane.points[0].x;
+            dy = lane.points[1].y - lane.points[0].y;
+        } else if (i + 1 == n) {
+            dx = lane.points[n - 1].x - lane.points[n - 2].x;
+            dy = lane.points[n - 1].y - lane.points[n - 2].y;
+        } else {
+            dx = lane.points[i + 1].x - lane.points[i - 1].x;
+            dy = lane.points[i + 1].y - lane.points[i - 1].y;
+        }
+        lane.points[i].yaw = std::atan2(dy, dx);
+        lane.points[i].kappa = 0.0;
+    }
+
+    // 2) curvature kappa by central finite difference
+    for (size_t i = 1; i + 1 < n; i++) {
+        const double xm = lane.points[i - 1].x;
+        const double ym = lane.points[i - 1].y;
+        const double x0 = lane.points[i].x;
+        const double y0 = lane.points[i].y;
+        const double xp = lane.points[i + 1].x;
+        const double yp = lane.points[i + 1].y;
+
+        const double x1 = 0.5 * (xp - xm);
+        const double y1 = 0.5 * (yp - ym);
+        const double x2 = xp - 2.0 * x0 + xm;
+        const double y2 = yp - 2.0 * y0 + ym;
+        const double den = std::pow(x1 * x1 + y1 * y1, 1.5);
+        lane.points[i].kappa = (den > 1e-9) ? ((x1 * y2 - y1 * x2) / den) : 0.0;
+    }
+
+    if (n >= 3) {
+        lane.points[0].kappa = lane.points[1].kappa;
+        lane.points[n - 1].kappa = lane.points[n - 2].kappa;
+    }
+}
+
 // ─── data structures ──────────────────────────────────────────
 
 struct NuScenesBox {
@@ -59,16 +106,12 @@ struct CameraInfo {
     std::array<double, 16> global_to_cam;  // row-major 4x4
 };
 
-struct LanePolyline {
-    string token;
-    vector<PointXYZ> points;
-};
-
 struct NuScenesFrame {
     double timestamp;
     double ego_x, ego_y, ego_yaw;
     vector<NuScenesBox> boxes;
     vector<LanePolyline> lanes;
+    vector<RoadPolygon> road_polygons;
 
     string lidar_filepath;                   // relative to dataroot
     std::array<double, 16> lidar_to_global;  // row-major 4x4
@@ -147,7 +190,72 @@ vector<NuScenesFrame> readFrames(const string& filepath)
             iss >> lane.token >> n_points;
             if (n_points < 2) continue;
 
+            // New format: length_m + (x y yaw kappa) for each point.
+            // Backward-compatible with old formats:
+            //   (x y yaw kappa) ...  or  (x y) ...
+            vector<double> vals;
+            vals.reserve(std::max(0, n_points * 4));
+            double v = 0.0;
+            while (iss >> v) vals.push_back(v);
+
             lane.points.reserve(n_points);
+            if (static_cast<int>(vals.size()) >= 1 + n_points * 4) {
+                for (int i = 0; i < n_points; i++) {
+                    LanePolyline::Point p;
+                    p.x = vals[1 + i * 4 + 0];
+                    p.y = vals[1 + i * 4 + 1];
+                    p.yaw = vals[1 + i * 4 + 2];
+                    p.kappa = vals[1 + i * 4 + 3];
+                    lane.points.push_back(p);
+                }
+                lane.length_m = vals[0];
+            } else if (static_cast<int>(vals.size()) >= n_points * 4) {
+                for (int i = 0; i < n_points; i++) {
+                    LanePolyline::Point p;
+                    p.x = vals[i * 4 + 0];
+                    p.y = vals[i * 4 + 1];
+                    p.yaw = vals[i * 4 + 2];
+                    p.kappa = vals[i * 4 + 3];
+                    lane.points.push_back(p);
+                }
+            } else if (static_cast<int>(vals.size()) >= n_points * 2) {
+                for (int i = 0; i < n_points; i++) {
+                    LanePolyline::Point p;
+                    p.x = vals[i * 2 + 0];
+                    p.y = vals[i * 2 + 1];
+                    lane.points.push_back(p);
+                }
+                computeLaneYawAndKappa(lane);
+            }
+
+            if (lane.points.size() >= 2) {
+                if (lane.length_m <= 1e-6) {
+                    double len = 0.0;
+                    for (size_t i = 1; i < lane.points.size(); i++) {
+                        double dx = lane.points[i].x - lane.points[i - 1].x;
+                        double dy = lane.points[i].y - lane.points[i - 1].y;
+                        len += std::hypot(dx, dy);
+                    }
+                    lane.length_m = len;
+                }
+                currentFrame.lanes.push_back(lane);
+            }
+        }
+        else if ((tag == "ROADSEG" || tag == "ROADBLOCK") && inFrame) {
+            RoadPolygon road_poly;
+            road_poly.layer = (tag == "ROADSEG") ? "road_segment" : "road_block";
+
+            int n_points = 0;
+            if (tag == "ROADSEG") {
+                int is_intersection = 0;
+                iss >> road_poly.token >> is_intersection >> n_points;
+                road_poly.is_intersection = (is_intersection != 0);
+            } else {
+                iss >> road_poly.token >> n_points;
+            }
+            if (n_points < 3) continue;
+
+            road_poly.points.reserve(n_points);
             for (int i = 0; i < n_points; i++) {
                 double x, y;
                 if (!(iss >> x >> y)) break;
@@ -155,10 +263,11 @@ vector<NuScenesFrame> readFrames(const string& filepath)
                 p.x = static_cast<float>(x);
                 p.y = static_cast<float>(y);
                 p.z = 0.0f;
-                lane.points.push_back(p);
+                road_poly.points.push_back(p);
             }
-            if (lane.points.size() >= 2)
-                currentFrame.lanes.push_back(lane);
+            if (road_poly.points.size() >= 3) {
+                currentFrame.road_polygons.push_back(road_poly);
+            }
         }
         else if (tag == "ENDFRAME" && inFrame) {
             frames.push_back(currentFrame);
@@ -386,8 +495,11 @@ void publishVisualization(
     ros::Publisher& vis_pub,
     ros::Publisher& vis_pub2,
     ros::Publisher& lane_pub,
+    ros::Publisher& lane_aux_pub,
+    ros::Publisher& lane_token_pub,
     ros::Publisher& box_pub,
     ros::Publisher& hud_pub,
+    ros::Publisher& pred_pub,
     ros::Publisher& label_pub,
     const NuScenesFrame& frame,
     const PointCloud<PointXYZ>& targetPoints,
@@ -397,6 +509,7 @@ void publishVisualization(
     const vector<bool>& isVisVec,
     const vector<PointCloud<PointXYZ>>& visBBs,
     const vector<int>& trackIds,
+    const PredictionConfig& pred_cfg,
     const ros::Time& stamp,
     size_t frame_idx,
     size_t total_frames)
@@ -416,8 +529,103 @@ void publishVisualization(
     lanes_marker.color.b = 0.85f;
     lanes_marker.color.a = 0.75f;
     lanes_marker.lifetime = ros::Duration(1.0);
+
+    visualization_msgs::Marker lane_start_marker;
+    lane_start_marker.header.frame_id = GLOBAL_FRAME;
+    lane_start_marker.header.stamp = stamp;
+    lane_start_marker.ns = "lane_start";
+    lane_start_marker.id = 1;
+    lane_start_marker.action = visualization_msgs::Marker::ADD;
+    lane_start_marker.type = visualization_msgs::Marker::SPHERE_LIST;
+    lane_start_marker.pose.orientation.w = 1.0;
+    lane_start_marker.scale.x = 0.28;
+    lane_start_marker.scale.y = 0.28;
+    lane_start_marker.scale.z = 0.28;
+    lane_start_marker.color.r = 1.0f;
+    lane_start_marker.color.g = 0.0f;
+    lane_start_marker.color.b = 0.0f;
+    lane_start_marker.color.a = 0.95f;
+    lane_start_marker.lifetime = ros::Duration(1.0);
+
+    visualization_msgs::Marker lane_end_marker;
+    lane_end_marker.header.frame_id = GLOBAL_FRAME;
+    lane_end_marker.header.stamp = stamp;
+    lane_end_marker.ns = "lane_end";
+    lane_end_marker.id = 2;
+    lane_end_marker.action = visualization_msgs::Marker::ADD;
+    lane_end_marker.type = visualization_msgs::Marker::SPHERE_LIST;
+    lane_end_marker.pose.orientation.w = 1.0;
+    lane_end_marker.scale.x = 0.28;
+    lane_end_marker.scale.y = 0.28;
+    lane_end_marker.scale.z = 0.28;
+    lane_end_marker.color.r = 0.0f;
+    lane_end_marker.color.g = 1.0f;
+    lane_end_marker.color.b = 0.0f;
+    lane_end_marker.color.a = 0.95f;
+    lane_end_marker.lifetime = ros::Duration(1.0);
+
+    visualization_msgs::Marker lane_dir_marker;
+    lane_dir_marker.header.frame_id = GLOBAL_FRAME;
+    lane_dir_marker.header.stamp = stamp;
+    lane_dir_marker.ns = "lane_dir_arrow";
+    lane_dir_marker.id = 3;
+    lane_dir_marker.action = visualization_msgs::Marker::ADD;
+    lane_dir_marker.type = visualization_msgs::Marker::LINE_LIST;
+    lane_dir_marker.pose.orientation.w = 1.0;
+    lane_dir_marker.scale.x = 0.06;
+    lane_dir_marker.color.r = 1.0f;
+    lane_dir_marker.color.g = 0.9f;
+    lane_dir_marker.color.b = 0.0f;
+    lane_dir_marker.color.a = 0.95f;
+    lane_dir_marker.lifetime = ros::Duration(1.0);
+
     for (const auto& lane : frame.lanes) {
         if (lane.points.size() < 2) continue;
+
+        geometry_msgs::Point ps, pe;
+        ps.x = lane.points.front().x; ps.y = lane.points.front().y; ps.z = 0.08;
+        pe.x = lane.points.back().x;  pe.y = lane.points.back().y;  pe.z = 0.08;
+        lane_start_marker.points.push_back(ps);
+        lane_end_marker.points.push_back(pe);
+
+        // Direction arrow near lane start: start -> end.
+        const size_t tip_idx = std::min<size_t>(3, lane.points.size() - 1);
+        const auto& p0 = lane.points.front();
+        const auto& pdir = lane.points[tip_idx];
+        const double dx = pdir.x - p0.x;
+        const double dy = pdir.y - p0.y;
+        const double dn = std::hypot(dx, dy);
+        if (dn > 1e-3) {
+            const double ux = dx / dn;
+            const double uy = dy / dn;
+            const double shaft_len = std::min(1.0, std::max(0.35, 0.35 * dn));
+            const double head_len = 0.35;
+            const double head_ang = 0.5;  // ~28.6 deg
+
+            geometry_msgs::Point a0, a1, h1, h2;
+            a0.x = p0.x; a0.y = p0.y; a0.z = 0.10;
+            a1.x = p0.x + shaft_len * ux;
+            a1.y = p0.y + shaft_len * uy;
+            a1.z = 0.10;
+
+            const double c = std::cos(head_ang);
+            const double s = std::sin(head_ang);
+            const double bx1 = -head_len * (ux * c - uy * s);
+            const double by1 = -head_len * (ux * s + uy * c);
+            const double bx2 = -head_len * (ux * c + uy * s);
+            const double by2 = -head_len * (-ux * s + uy * c);
+
+            h1.x = a1.x + bx1; h1.y = a1.y + by1; h1.z = 0.10;
+            h2.x = a1.x + bx2; h2.y = a1.y + by2; h2.z = 0.10;
+
+            lane_dir_marker.points.push_back(a0);
+            lane_dir_marker.points.push_back(a1);
+            lane_dir_marker.points.push_back(a1);
+            lane_dir_marker.points.push_back(h1);
+            lane_dir_marker.points.push_back(a1);
+            lane_dir_marker.points.push_back(h2);
+        }
+
         for (size_t i = 0; i + 1 < lane.points.size(); i++) {
             geometry_msgs::Point p0, p1;
             p0.x = lane.points[i].x;     p0.y = lane.points[i].y;     p0.z = 0.03;
@@ -427,6 +635,9 @@ void publishVisualization(
         }
     }
     lane_pub.publish(lanes_marker);
+    lane_aux_pub.publish(lane_start_marker);
+    lane_aux_pub.publish(lane_end_marker);
+    lane_aux_pub.publish(lane_dir_marker);
 
     // --- Tracking points (colored by status) ---
     visualization_msgs::Marker pointsY, pointsG, pointsR, pointsB;
@@ -540,6 +751,132 @@ void publishVisualization(
         label_array.markers.push_back(label);
     }
     label_pub.publish(label_array);
+
+    // --- Vehicle trajectory prediction (implemented in trajectory_predictor.cpp) ---
+    vector<DetCategoryPoint> detections;
+    detections.reserve(frame.boxes.size());
+    for (const auto& box : frame.boxes) {
+        if (box.bbox.size() < 4) continue;
+        VectorXd cp = getCpFromBbox(box.bbox);
+        DetCategoryPoint d;
+        d.x = cp(0);
+        d.y = cp(1);
+        d.category = box.category;
+        detections.push_back(d);
+    }
+
+    vector<TrackKinematicState> tracks;
+    tracks.reserve(targetPoints.size());
+    for (size_t i = 0; i < targetPoints.size(); i++) {
+        TrackKinematicState st;
+        st.track_id = (i < trackIds.size()) ? trackIds[i] : static_cast<int>(i);
+        st.valid = !(std::isnan(targetPoints[i].x) || std::isnan(targetPoints[i].y));
+        st.x = targetPoints[i].x;
+        st.y = targetPoints[i].y;
+        st.is_static = (i < isStaticVec.size()) ? isStaticVec[i] : false;
+        st.mode_idx = (i < targetVandYaw.size() && targetVandYaw[i].size() > 4)
+                          ? static_cast<int>(targetVandYaw[i][4]) : -1;
+        st.v = (i < targetVandYaw.size() && targetVandYaw[i].size() > 0) ? targetVandYaw[i][0] : 0.0;
+        st.yaw = (i < targetVandYaw.size() && targetVandYaw[i].size() > 1) ? targetVandYaw[i][1] : 0.0;
+        st.accel = (i < targetVandYaw.size() && targetVandYaw[i].size() > 3) ? targetVandYaw[i][3] : 0.0;
+        st.yaw_rate = (i < targetVandYaw.size() && targetVandYaw[i].size() > 5) ? targetVandYaw[i][5] : 0.0;
+        st.track_manage = (i < trackManage.size()) ? trackManage[i] : 0;
+        tracks.push_back(st);
+    }
+
+    vector<PredTrajectory> pred_trajs =
+        buildVehiclePredictions(
+            frame.lanes, frame.road_polygons, detections, tracks, pred_cfg);
+
+    auto initPredMarker = [&](int id, float r, float g, float b) {
+        visualization_msgs::Marker m;
+        m.header.frame_id = GLOBAL_FRAME;
+        m.header.stamp = stamp;
+        m.ns = "vehicle_prediction";
+        m.id = id;
+        m.action = visualization_msgs::Marker::ADD;
+        m.type = visualization_msgs::Marker::LINE_LIST;
+        m.pose.orientation.w = 1.0;
+        m.scale.x = 0.12;
+        m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.95f;
+        m.lifetime = ros::Duration(1.0);
+        return m;
+    };
+
+    visualization_msgs::Marker pred_cvca = initPredMarker(0, 1.0f, 0.65f, 0.0f);  // orange
+    visualization_msgs::Marker pred_ctrv = initPredMarker(1, 1.0f, 0.0f, 1.0f);  // magenta
+
+    for (const auto& traj : pred_trajs) {
+        if (traj.points.size() < 2) continue;
+        visualization_msgs::Marker& m = (traj.mode_idx == 1) ? pred_ctrv : pred_cvca;
+        for (size_t k = 0; k + 1 < traj.points.size(); k++) {
+            geometry_msgs::Point p0, p1;
+            p0.x = traj.points[k].x;     p0.y = traj.points[k].y;     p0.z = 0.18;
+            p1.x = traj.points[k + 1].x; p1.y = traj.points[k + 1].y; p1.z = 0.18;
+            m.points.push_back(p0);
+            m.points.push_back(p1);
+        }
+    }
+
+    pred_pub.publish(pred_cvca);
+    pred_pub.publish(pred_ctrv);
+
+    // --- Selected reference lane tokens only ---
+    visualization_msgs::MarkerArray lane_token_array;
+    {
+        visualization_msgs::Marker del;
+        del.header.frame_id = GLOBAL_FRAME;
+        del.header.stamp = stamp;
+        del.ns = "lane_tokens";
+        del.action = visualization_msgs::Marker::DELETEALL;
+        lane_token_array.markers.push_back(del);
+    }
+    std::unordered_set<std::string> selected_lane_tokens;
+    for (const auto& traj : pred_trajs) {
+        for (const auto& tok : traj.selected_lane_tokens) {
+            if (!tok.empty()) selected_lane_tokens.insert(tok);
+        }
+    }
+    int lane_token_id = 0;
+    for (const auto& lane : frame.lanes) {
+        if (lane.points.size() < 2) continue;
+        if (selected_lane_tokens.find(lane.token) == selected_lane_tokens.end()) continue;
+
+        const auto& p0 = lane.points.front();
+        const auto& p1 = lane.points[std::min<size_t>(1, lane.points.size() - 1)];
+        const double dx = p1.x - p0.x;
+        const double dy = p1.y - p0.y;
+        const double dn = std::hypot(dx, dy);
+        double nx = 0.0;
+        double ny = 0.0;
+        if (dn > 1e-3) {
+            const double ux = dx / dn;
+            const double uy = dy / dn;
+            nx = -uy;
+            ny = ux;
+        }
+
+        visualization_msgs::Marker m;
+        m.header.frame_id = GLOBAL_FRAME;
+        m.header.stamp = stamp;
+        m.ns = "lane_tokens";
+        m.id = lane_token_id++;
+        m.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        m.action = visualization_msgs::Marker::ADD;
+        m.lifetime = ros::Duration(1.0);
+        m.pose.position.x = p0.x + 0.5 * nx;
+        m.pose.position.y = p0.y + 0.5 * ny;
+        m.pose.position.z = 0.6;
+        m.pose.orientation.w = 1.0;
+        m.scale.z = 0.45;
+        m.color.r = 0.95f;
+        m.color.g = 0.95f;
+        m.color.b = 0.15f;
+        m.color.a = 0.95f;
+        m.text = lane.token;
+        lane_token_array.markers.push_back(m);
+    }
+    lane_token_pub.publish(lane_token_array);
 
     // --- Velocity arrows ---
     {
@@ -682,10 +1019,21 @@ int main(int argc, char** argv)
 
     string data_file, result_file, nuscenes_dataroot;
     double initial_rate;
+    PredictionConfig pred_cfg;
     nh.param<string>("data_file", data_file, "");
     nh.param<string>("result_file", result_file, "tracking_results.txt");
     nh.param<double>("playback_rate", initial_rate, 2.0);
     nh.param<string>("nuscenes_dataroot", nuscenes_dataroot, "");
+    nh.param<double>("prediction_horizon_s", pred_cfg.horizon_s, 5.0);
+    nh.param<double>("prediction_step_s", pred_cfg.step_s, 0.1);
+    nh.param<double>("prediction_min_ref_length_m", pred_cfg.min_ref_length_m, 50.0);
+    nh.param<double>("prediction_stitch_max_gap_m", pred_cfg.stitch_max_gap_m, 1.0);
+
+    if (pred_cfg.horizon_s <= 0.0) pred_cfg.horizon_s = 5.0;
+    if (pred_cfg.step_s <= 0.0) pred_cfg.step_s = 0.1;
+    if (pred_cfg.step_s > pred_cfg.horizon_s) pred_cfg.step_s = pred_cfg.horizon_s;
+    if (pred_cfg.min_ref_length_m < 1.0) pred_cfg.min_ref_length_m = 50.0;
+    if (pred_cfg.stitch_max_gap_m <= 0.0) pred_cfg.stitch_max_gap_m = 1.0;
 
     { std::lock_guard<std::mutex> lock(g_rate_mutex); g_playback_rate = initial_rate; }
 
@@ -708,6 +1056,9 @@ int main(int argc, char** argv)
     ROS_INFO("Result file:   %s", result_file.c_str());
     ROS_INFO("Dataroot:      %s", nuscenes_dataroot.c_str());
     ROS_INFO("Playback rate: %.1f Hz (adjustable via /playback_rate topic)", initial_rate);
+    ROS_INFO("Prediction:    horizon=%.2fs, step=%.2fs, min_ref_len=%.1fm, stitch_gap=%.1fm",
+             pred_cfg.horizon_s, pred_cfg.step_s,
+             pred_cfg.min_ref_length_m, pred_cfg.stitch_max_gap_m);
 
     vector<NuScenesFrame> frames = readFrames(data_file);
     ROS_INFO("Loaded %zu frames", frames.size());
@@ -717,8 +1068,11 @@ int main(int argc, char** argv)
     ros::Publisher vis_pub    = nh.advertise<visualization_msgs::Marker>("/visualization_marker", 100);
     ros::Publisher vis_pub2   = nh.advertise<visualization_msgs::Marker>("/visualization_marker2", 100);
     ros::Publisher lane_pub   = nh.advertise<visualization_msgs::Marker>("/visualization_marker_lane", 100);
+    ros::Publisher lane_aux_pub = nh.advertise<visualization_msgs::Marker>("/visualization_marker_lane_aux", 100);
+    ros::Publisher lane_token_pub = nh.advertise<visualization_msgs::MarkerArray>("/visualization_marker_lane_token", 100);
     ros::Publisher box_pub    = nh.advertise<visualization_msgs::Marker>("/visualization_marker_boxes", 100);
     ros::Publisher hud_pub    = nh.advertise<visualization_msgs::Marker>("/visualization_marker_hud", 100);
+    ros::Publisher pred_pub   = nh.advertise<visualization_msgs::Marker>("/visualization_marker_prediction", 100);
     ros::Publisher label_pub  = nh.advertise<visualization_msgs::MarkerArray>("/track_labels", 100);
     ros::Publisher cloud_pub  = nh.advertise<sensor_msgs::PointCloud2>("/nuscenes/lidar", 1);
 
@@ -830,10 +1184,10 @@ int main(int argc, char** argv)
         tf_broadcaster.sendTransform(
             tf::StampedTransform(ego_tf, stamp, GLOBAL_FRAME, "ego_vehicle"));
 
-        publishVisualization(vis_pub, vis_pub2, lane_pub, box_pub, hud_pub, label_pub, frame,
+        publishVisualization(vis_pub, vis_pub2, lane_pub, lane_aux_pub, lane_token_pub, box_pub, hud_pub, pred_pub, label_pub, frame,
                              targetPoints, targetVandYaw,
                              trackManage, isStaticVec, isVisVec, visBBs,
-                             trackIds,
+                             trackIds, pred_cfg,
                              stamp, fi, frames.size());
 
         // Publish LiDAR point cloud

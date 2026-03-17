@@ -1097,6 +1097,9 @@ void immUkfJpdaf(vector<PointCloud<PointXYZ>> bBoxes, double timestamp,double ca
         targetPoints.push_back(o);
 
         vector<double> VandYaw;
+        // VandYaw fields:
+        // [0] speed v, [1] yaw, [2] modeProbCA, [3] accel(from CA state),
+        // [4] dominant mode index (CV/CTRV/RM/CA), [5] yaw_rate
         VandYaw.push_back(tv);
         VandYaw.push_back(tyaw);
         VandYaw.push_back(targets_[i].modeProbCA_);
@@ -1113,6 +1116,7 @@ void immUkfJpdaf(vector<PointCloud<PointXYZ>> bBoxes, double timestamp,double ca
             modeIdx = 1;  // 强制CTRV
         }
         VandYaw.push_back(static_cast<double>(modeIdx));
+        VandYaw.push_back(yawRate);
         targetVandYaw.push_back(VandYaw);
 
         isStaticVec.push_back(false);

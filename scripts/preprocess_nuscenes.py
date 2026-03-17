@@ -65,6 +65,65 @@ def slerp_yaw(yaw0, yaw1, t):
     return yaw0 + t * diff
 
 
+def compute_xy_yaw_kappa(xy):
+    """
+    Given a polyline [(x, y), ...], return [(x, y, yaw, kappa), ...].
+    """
+    n = len(xy)
+    if n < 2:
+        return []
+
+    pts = np.asarray(xy, dtype=float)
+    yaw = np.zeros(n, dtype=float)
+    kappa = np.zeros(n, dtype=float)
+
+    # 1) tangent yaw for each point
+    for i in range(n):
+        if i == 0:
+            dx = pts[1, 0] - pts[0, 0]
+            dy = pts[1, 1] - pts[0, 1]
+        elif i == n - 1:
+            dx = pts[n - 1, 0] - pts[n - 2, 0]
+            dy = pts[n - 1, 1] - pts[n - 2, 1]
+        else:
+            dx = pts[i + 1, 0] - pts[i - 1, 0]
+            dy = pts[i + 1, 1] - pts[i - 1, 1]
+        yaw[i] = np.arctan2(dy, dx)
+
+    # 2) curvature kappa by central finite difference
+    for i in range(1, n - 1):
+        xm, ym = pts[i - 1, 0], pts[i - 1, 1]
+        x0, y0 = pts[i, 0], pts[i, 1]
+        xp, yp = pts[i + 1, 0], pts[i + 1, 1]
+
+        x1 = 0.5 * (xp - xm)
+        y1 = 0.5 * (yp - ym)
+        x2 = xp - 2.0 * x0 + xm
+        y2 = yp - 2.0 * y0 + ym
+        den = np.power(x1 * x1 + y1 * y1, 1.5)
+        if den > 1e-9:
+            kappa[i] = (x1 * y2 - y1 * x2) / den
+
+    if n >= 3:
+        kappa[0] = kappa[1]
+        kappa[n - 1] = kappa[n - 2]
+
+    return [(float(pts[i, 0]), float(pts[i, 1]),
+             float(yaw[i]), float(kappa[i])) for i in range(n)]
+
+
+def compute_polyline_length_xyyk(xyyk):
+    """Compute polyline length from [(x, y, yaw, kappa), ...]."""
+    if len(xyyk) < 2:
+        return 0.0
+    length = 0.0
+    for i in range(1, len(xyyk)):
+        dx = xyyk[i][0] - xyyk[i - 1][0]
+        dy = xyyk[i][1] - xyyk[i - 1][1]
+        length += float(np.hypot(dx, dy))
+    return float(length)
+
+
 def compute_box_corners(translation, size, rotation):
     """
     Compute 3D bounding box corners from nuScenes annotation.
@@ -132,6 +191,13 @@ class NuScenesParser:
         self.meta_dir = os.path.join(dataroot, version)
         self.nusc_maps = {}
 
+        # Map extraction caches (significantly reduces repeated map API calls).
+        self._cache_grid_m = 1.0
+        self._lane_centerline_cache = {}   # (map, resolution, token) -> (length_m, [(x,y,yaw,kappa), ...])
+        self._lane_radius_cache = {}       # (map, qx, qy, radius, resolution, max_lanes) -> lanes
+        self._road_polygon_cache = {}      # (map, layer, token) -> (is_intersection, [(x,y), ...])
+        self._road_radius_cache = {}       # (map, qx, qy, radius, max_polys) -> road polygons
+
         print(f"Loading nuScenes tables from {self.meta_dir} ...")
         self.scenes = self._load('scene.json')
         self.samples = self._load('sample.json')
@@ -191,7 +257,7 @@ class NuScenesParser:
     def _init_maps(self):
         """Load map-expansion files for all locations present in this split."""
         if NuScenesMap is None:
-            print("[WARN] nuscenes-devkit map API not available; skipping lane export.")
+            print("[WARN] nuscenes-devkit map API not available; skipping map export.")
             return
 
         map_root = os.path.join(self.dataroot, 'maps', 'expansion')
@@ -215,15 +281,28 @@ class NuScenesParser:
             except Exception as e:
                 print(f"[WARN] failed to load map {map_name}: {e}")
 
+    def _quantize_xy(self, x, y):
+        q = max(self._cache_grid_m, 1e-3)
+        return int(round(x / q)), int(round(y / q))
+
     def _extract_lanes(self, map_name, ego_x, ego_y, radius_m=55.0,
                        resolution_m=1.0, max_lanes=120):
         """
         Extract nearby lane/lane_connector centerlines around ego position.
-        Returns a list of (token, [(x, y), ...]).
+        Returns a list of (token, length_m, [(x, y, yaw, kappa), ...]).
         """
         nusc_map = self.nusc_maps.get(map_name)
         if nusc_map is None:
             return []
+
+        qx, qy = self._quantize_xy(ego_x, ego_y)
+        radius_key = (
+            map_name, qx, qy,
+            float(radius_m), float(resolution_m), int(max_lanes)
+        )
+        cached_lanes = self._lane_radius_cache.get(radius_key)
+        if cached_lanes is not None:
+            return cached_lanes
 
         records = nusc_map.get_records_in_radius(
             ego_x, ego_y, radius_m, ['lane', 'lane_connector'])
@@ -234,19 +313,125 @@ class NuScenesParser:
         if len(lane_tokens) > max_lanes:
             lane_tokens = lane_tokens[:max_lanes]
 
-        lane_points = nusc_map.discretize_lanes(lane_tokens, resolution_m)
         lanes = []
-        for token, points in lane_points.items():
-            if points is None or len(points) < 2:
-                continue
-            xy = []
-            for p in points:
-                if len(p) < 2:
-                    continue
-                xy.append((float(p[0]), float(p[1])))
-            if len(xy) >= 2:
-                lanes.append((token, xy))
+        for token in lane_tokens:
+            centerline_key = (map_name, float(resolution_m), token)
+            lane_data = self._lane_centerline_cache.get(centerline_key)
+            if lane_data is None:
+                centerline = []
+                try:
+                    lane_points = nusc_map.discretize_lanes([token], resolution_m)
+                    points = lane_points.get(token)
+                except Exception:
+                    points = None
+
+                if points is not None and len(points) >= 2:
+                    xy = []
+                    for p in points:
+                        if len(p) < 2:
+                            continue
+                        xy.append((float(p[0]), float(p[1])))
+                    if len(xy) >= 2:
+                        centerline = compute_xy_yaw_kappa(xy)
+                lane_data = (compute_polyline_length_xyyk(centerline), centerline)
+                self._lane_centerline_cache[centerline_key] = lane_data
+
+            length_m, centerline = lane_data
+            if len(centerline) >= 2:
+                lanes.append((token, length_m, centerline))
+
+        self._lane_radius_cache[radius_key] = lanes
         return lanes
+
+    @staticmethod
+    def _polygon_to_xy(poly):
+        """Convert a shapely polygon to a list of (x, y) exterior points."""
+        if poly is None or not hasattr(poly, 'exterior') or poly.exterior is None:
+            return []
+        coords = list(poly.exterior.coords)
+        xy = []
+        for p in coords:
+            if len(p) < 2:
+                continue
+            xy.append((float(p[0]), float(p[1])))
+        if len(xy) >= 2 and np.hypot(xy[0][0] - xy[-1][0], xy[0][1] - xy[-1][1]) < 1e-3:
+            xy = xy[:-1]
+        return xy
+
+    def _extract_road_polygons(self, map_name, ego_x, ego_y, radius_m=65.0,
+                               max_polys=240):
+        """
+        Extract nearby road_segment / road_block polygons around ego position.
+        Returns a list of (tag, token, is_intersection, [(x, y), ...]).
+        """
+        nusc_map = self.nusc_maps.get(map_name)
+        if nusc_map is None:
+            return []
+
+        qx, qy = self._quantize_xy(ego_x, ego_y)
+        radius_key = (map_name, qx, qy, float(radius_m), int(max_polys))
+        cached = self._road_radius_cache.get(radius_key)
+        if cached is not None:
+            return cached
+
+        records = nusc_map.get_records_in_radius(
+            ego_x, ego_y, radius_m, ['road_segment', 'road_block'])
+        seg_tokens = list(dict.fromkeys(records.get('road_segment', [])))
+        blk_tokens = list(dict.fromkeys(records.get('road_block', [])))
+
+        out = []
+
+        for tok in seg_tokens:
+            if len(out) >= max_polys:
+                break
+            poly_key = (map_name, 'road_segment', tok)
+            cached_poly = self._road_polygon_cache.get(poly_key)
+            if cached_poly is None:
+                is_intersection = 0
+                xy = []
+                rec = nusc_map.get('road_segment', tok)
+                poly_tok = rec.get('polygon_token')
+                if poly_tok:
+                    try:
+                        poly = nusc_map.extract_polygon(poly_tok)
+                        xy = self._polygon_to_xy(poly)
+                    except Exception:
+                        xy = []
+                if len(xy) >= 3:
+                    is_intersection = 1 if rec.get('is_intersection', False) else 0
+                self._road_polygon_cache[poly_key] = (is_intersection, xy)
+                cached_poly = self._road_polygon_cache[poly_key]
+
+            is_intersection, xy = cached_poly
+            if len(xy) < 3:
+                continue
+            out.append(('ROADSEG', tok, is_intersection, xy))
+
+        for tok in blk_tokens:
+            if len(out) >= max_polys:
+                break
+            poly_key = (map_name, 'road_block', tok)
+            cached_poly = self._road_polygon_cache.get(poly_key)
+            if cached_poly is None:
+                xy = []
+                rec = nusc_map.get('road_block', tok)
+                poly_tok = rec.get('polygon_token')
+                if poly_tok:
+                    try:
+                        poly = nusc_map.extract_polygon(poly_tok)
+                        xy = self._polygon_to_xy(poly)
+                    except Exception:
+                        xy = []
+                self._road_polygon_cache[poly_key] = (0, xy)
+                cached_poly = self._road_polygon_cache[poly_key]
+
+            _, xy = cached_poly
+            if len(xy) < 3:
+                continue
+            out.append(('ROADBLOCK', tok, 0, xy))
+
+        self._road_radius_cache[radius_key] = out
+        return out
 
     def get_scene_samples(self, scene):
         """Get all samples in a scene, ordered chronologically."""
@@ -320,7 +505,7 @@ class NuScenesParser:
         return list(tr), list(sz), q_interp
 
     def _write_frame(self, f, timestamp, ego_x, ego_y, ego_yaw,
-                     lidar_sd, camera_sds, annotations, lanes):
+                     lidar_sd, camera_sds, annotations, lanes, road_polygons):
         """Write a single frame (keyframe or interpolated) to the output file."""
         f.write(f"FRAME {timestamp:.6f} {ego_x:.6f} {ego_y:.6f} {ego_yaw:.6f}\n")
 
@@ -360,9 +545,18 @@ class NuScenesParser:
             )
             frame_boxes += 1
 
-        for lane_token, lane_pts in lanes:
-            flat = ' '.join(f'{x:.6f} {y:.6f}' for x, y in lane_pts)
-            f.write(f"LANE {lane_token} {len(lane_pts)} {flat}\n")
+        for lane_token, lane_length_m, lane_pts in lanes:
+            flat = ' '.join(
+                f'{x:.6f} {y:.6f} {yaw:.6f} {kappa:.6f}'
+                for x, y, yaw, kappa in lane_pts)
+            f.write(f"LANE {lane_token} {len(lane_pts)} {lane_length_m:.6f} {flat}\n")
+
+        for tag, poly_token, is_intersection, poly_pts in road_polygons:
+            flat = ' '.join(f'{x:.6f} {y:.6f}' for x, y in poly_pts)
+            if tag == 'ROADSEG':
+                f.write(f"ROADSEG {poly_token} {is_intersection} {len(poly_pts)} {flat}\n")
+            else:
+                f.write(f"ROADBLOCK {poly_token} {len(poly_pts)} {flat}\n")
 
         f.write("ENDFRAME\n\n")
         return frame_boxes
@@ -396,7 +590,9 @@ class NuScenesParser:
             f.write("#   CAMERA <ch> <rel_path> <fx fy cx cy>"
                     " <16 floats: 4x4 global_to_sensor>\n")
             f.write("#   BOX x1 y1 ... minZ maxZ instance_token category\n")
-            f.write("#   LANE lane_token n_points x1 y1 x2 y2 ...\n")
+            f.write("#   LANE lane_token n_points length_m x1 y1 yaw1 kappa1 x2 y2 yaw2 kappa2 ...\n")
+            f.write("#   ROADSEG token is_intersection n_points x1 y1 ...\n")
+            f.write("#   ROADBLOCK token n_points x1 y1 ...\n")
             f.write("#   ENDFRAME\n\n")
 
             total_boxes = 0
@@ -441,9 +637,10 @@ class NuScenesParser:
 
                 # Write keyframe
                 lanes = self._extract_lanes(map_name, ego_x, ego_y)
+                road_polygons = self._extract_road_polygons(map_name, ego_x, ego_y)
                 nb = self._write_frame(
                     f, timestamp, ego_x, ego_y, ego_yaw,
-                    lidar_sd, camera_sds, kf_annotations, lanes)
+                    lidar_sd, camera_sds, kf_annotations, lanes, road_polygons)
                 total_boxes += nb
                 total_frames += 1
 
@@ -538,12 +735,15 @@ class NuScenesParser:
                             'category': a0['category'],
                         })
 
+                    interp_road_polygons = self._extract_road_polygons(
+                        map_name, ie_x, ie_y)
                     nb = self._write_frame(
                         f, interp_ts, ie_x, ie_y, ie_yaw,
                         best_lidar,
                         interp_cam_sds if interp_cam_sds else None,
                         interp_annos,
-                        self._extract_lanes(map_name, ie_x, ie_y))
+                        self._extract_lanes(map_name, ie_x, ie_y),
+                        interp_road_polygons)
                     total_boxes += nb
                     total_frames += 1
 

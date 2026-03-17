@@ -7,9 +7,12 @@
 #   ./run_nuscenes.sh scene-0061              # 运行指定场景
 #   ./run_nuscenes.sh all --no-eval           # 只跑跟踪，不评估
 #   ./run_nuscenes.sh scene-0061 --viz        # 带 RViz 可视化（2Hz 慢速回放）
+#   ./run_nuscenes.sh scene-0061 noPre        # 如果已有预处理文件则跳过预处理
 #   ./run_nuscenes.sh scene-0061 --10hz       # 插值到 10Hz（dt≈0.1s）
 #   ./run_nuscenes.sh scene-0061 --20hz --viz # 插值到 20Hz + 可视化
+#   ./run_nuscenes.sh scene-0103 --20hz --viz --noPre # 插值到 20Hz + 可视化 + 跳过预处理
 #   ./run_nuscenes.sh scene-0061 --interp=10  # 自定义插值帧率
+#   ./run_nuscenes.sh scene-0061 --pred-horizon=5.0 --pred-step=0.1
 #
 
 set -e
@@ -24,20 +27,26 @@ CATKIN_WS="$HOME/dongbeidaxue/nuscenes_ws"
 SCENE="${1:-all}"
 SKIP_EVAL=false
 WITH_VIZ=false
+SKIP_PREPROCESS=false
 INTERP_HZ=0
+PRED_HORIZON=5.0
+PRED_STEP=0.1
 
 for arg in "$@"; do
     case $arg in
+        --noPre)      SKIP_PREPROCESS=true ;;
         --no-eval)  SKIP_EVAL=true ;;
         --viz)      WITH_VIZ=true ;;
         --interp=*) INTERP_HZ="${arg#*=}" ;;
         --10hz)     INTERP_HZ=10 ;;
         --20hz)     INTERP_HZ=20 ;;
+        --pred-horizon=*) PRED_HORIZON="${arg#*=}" ;;
+        --pred-step=*)    PRED_STEP="${arg#*=}" ;;
     esac
 done
 
 # 过滤掉选项参数，保留场景名
-if [[ "$SCENE" == --* ]]; then
+if [[ "$SCENE" == --* || "$SCENE" == "noPre" ]]; then
     SCENE="all"
 fi
 
@@ -106,10 +115,34 @@ if [ "$INTERP_HZ" -gt 0 ] 2>/dev/null; then
     info "插值帧率: ${INTERP_HZ} Hz"
 fi
 
-python3 "$SCRIPT_DIR/scripts/preprocess_nuscenes.py" \
-    --dataroot "$NUSCENES_DATAROOT" \
-    --output_dir "$PREPROCESS_DIR" \
-    $SCENE_ARG $INTERP_ARG
+PREPROCESS_NEEDED=true
+if [ "$SKIP_PREPROCESS" = true ]; then
+    if [ "$SCENE" = "all" ]; then
+        if ls "$PREPROCESS_DIR"/scene-*.txt >/dev/null 2>&1; then
+            PREPROCESS_NEEDED=false
+            info "检测到已有 scene-*.txt，按 noPre 跳过预处理"
+        else
+            warn "未找到现有预处理文件，仍将执行预处理"
+        fi
+    else
+        TARGET_PRE_FILE="$PREPROCESS_DIR/${SCENE}.txt"
+        if [ -f "$TARGET_PRE_FILE" ]; then
+            PREPROCESS_NEEDED=false
+            info "检测到已有预处理文件: $TARGET_PRE_FILE，按 noPre 跳过预处理"
+        else
+            warn "未找到 $TARGET_PRE_FILE，仍将执行预处理"
+        fi
+    fi
+fi
+
+if [ "$PREPROCESS_NEEDED" = true ]; then
+    python3 "$SCRIPT_DIR/scripts/preprocess_nuscenes.py" \
+        --dataroot "$NUSCENES_DATAROOT" \
+        --output_dir "$PREPROCESS_DIR" \
+        $SCENE_ARG $INTERP_ARG
+else
+    info "跳过预处理"
+fi
 
 info "预处理完成: $PREPROCESS_DIR"
 
@@ -152,12 +185,15 @@ if [ "$WITH_VIZ" = true ]; then
         VIZ_RATE=2
     fi
     info "播放速率: ${VIZ_RATE} Hz (实时速度)"
+    info "预测参数: horizon=${PRED_HORIZON}s, step=${PRED_STEP}s"
 
     roslaunch object_tracking nuscenes_test.launch \
         data_file:="$SCENE_FILE" \
         result_file:="$RESULT_FILE" \
         playback_rate:="$VIZ_RATE" \
         nuscenes_dataroot:="$NUSCENES_DATAROOT" \
+        prediction_horizon_s:="$PRED_HORIZON" \
+        prediction_step_s:="$PRED_STEP" \
         viz:=true
 
     # 评估
@@ -201,6 +237,8 @@ for SCENE_FILE in $SCENE_FILES; do
         _data_file:="$SCENE_FILE" \
         _result_file:="$RESULT_FILE" \
         _playback_rate:=1000.0 \
+        _prediction_horizon_s:="$PRED_HORIZON" \
+        _prediction_step_s:="$PRED_STEP" \
         2>&1 | grep -E "Frame.*/|=== "
 
     if [ ! -f "$RESULT_FILE" ]; then

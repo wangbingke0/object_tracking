@@ -13,6 +13,10 @@
     <!-- Path to nuScenes dataset root (for loading raw sensor data) -->
     <arg name="nuscenes_dataroot" default="$(find object_tracking)/v1.0-mini"/>
 
+    <!-- Trajectory prediction config -->
+    <arg name="prediction_horizon_s" default="5.0"/>
+    <arg name="prediction_step_s" default="0.1"/>
+
     <!-- Whether to launch RViz -->
     <arg name="viz" default="true"/>
 
@@ -21,6 +25,8 @@
         <param name="result_file"        value="$(arg result_file)"/>
         <param name="playback_rate"      value="$(arg playback_rate)"/>
         <param name="nuscenes_dataroot"  value="$(arg nuscenes_dataroot)"/>
+        <param name="prediction_horizon_s" value="$(arg prediction_horizon_s)"/>
+        <param name="prediction_step_s"    value="$(arg prediction_step_s)"/>
     </node>
 
     <!-- RViz with pre-configured display -->

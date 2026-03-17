@@ -1,27 +1,5 @@
 # nuScenes IMM-UKF-JPDA Tracking Evaluation Summary
-# 2026年 03月 10日 星期二 16:59:24 CST
+# Tue Mar 17 14:54:30 CST 2026
 
---- scene-0103 ---
-Loading tracking results...
-  Loaded 40 frames
-Loading ground truth...
-  Loaded 40 frames
-
-Evaluating (match_threshold=2.0m, min_track_manage=5)...
-
-==================================================
-  MOT Evaluation Results
-==================================================
-  Frames evaluated: 40
-  Total GT objects:  1719
-  Total matches:     886
-  False Positives:   173
-  False Negatives:   833
-  ID Switches:       374
---------------------------------------------------
-  MOTA:      0.1972
-  MOTP:      0.2549 m
-  Precision: 0.8366
-  Recall:    0.5154
-==================================================
+# Tue Mar 17 14:54:30 CST 2026
 

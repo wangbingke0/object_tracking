@@ -76,6 +76,7 @@ endif()
 # =============================================
 set(SOURCE_FILES_NUSCENES
   src/tracking/nuscenes_main.cpp
+  src/tracking/trajectory_predictor.cpp
   src/tracking/imm_ukf_jpda.cpp
   src/tracking/ukf.cpp
 )

@@ -57,8 +57,22 @@ Visualization Manager:
 
     - Class: rviz/Marker
       Enabled: true
+      Name: LaneAuxMarkers
+      Marker Topic: /visualization_marker_lane_aux
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
       Name: BoxMarkers
       Marker Topic: /visualization_marker_boxes
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/Marker
+      Enabled: true
+      Name: PredictionMarkers
+      Marker Topic: /visualization_marker_prediction
       Queue Size: 100
       Value: true
 
@@ -80,6 +94,13 @@ Visualization Manager:
       Enabled: true
       Name: TrackLabels
       Marker Topic: /track_labels
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: LaneTokenMarkers
+      Marker Topic: /visualization_marker_lane_token
       Queue Size: 100
       Value: true
 
