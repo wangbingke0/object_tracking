@@ -784,6 +784,50 @@ void publishVisualization(
         tracks.push_back(st);
     }
 
+    // Print model probabilities in terminal:
+    // only for vehicle targets and only when selected mode is not RM.
+    {
+        const double ASSOC_DIST = 3.0;
+        for (size_t i = 0; i < targetPoints.size(); i++) {
+            if (i >= trackManage.size() || trackManage[i] == 0) continue;
+            if (std::isnan(targetPoints[i].x) || std::isnan(targetPoints[i].y)) continue;
+            if (i >= targetVandYaw.size() || targetVandYaw[i].size() <= 8) continue;
+
+            int modeIdx = static_cast<int>(targetVandYaw[i][4]);
+            if (modeIdx == 2) continue;  // skip RM
+
+            bool isVehicle = false;
+            double tx = targetPoints[i].x;
+            double ty = targetPoints[i].y;
+            double bestD = ASSOC_DIST + 1.0;
+            size_t bestIdx = 0;
+            for (size_t b = 0; b < frame.boxes.size(); b++) {
+                if (frame.boxes[b].bbox.size() < 4) continue;
+                VectorXd cp = getCpFromBbox(frame.boxes[b].bbox);
+                double d = std::hypot(tx - cp(0), ty - cp(1));
+                if (d < bestD) {
+                    bestD = d;
+                    bestIdx = b;
+                }
+            }
+            if (bestD < ASSOC_DIST &&
+                frame.boxes[bestIdx].category.find("vehicle.") == 0) {
+                isVehicle = true;
+            }
+            if (!isVehicle) continue;
+
+            const int tid = (i < trackIds.size()) ? trackIds[i] : static_cast<int>(i);
+            const char* modeStr = (modeIdx == 0) ? "CV" :
+                                  (modeIdx == 1) ? "CTRV" :
+                                  (modeIdx == 2) ? "RM" : "CA";
+            ROS_INFO("[ModeProb] track=%d CV=%.3f CTRV=%.3f RM=%.3f CA=%.3f selected=%s",
+                     tid,
+                     targetVandYaw[i][6], targetVandYaw[i][7],
+                     targetVandYaw[i][8], targetVandYaw[i][9],
+                     modeStr);
+        }
+    }
+
     vector<PredTrajectory> pred_trajs =
         buildVehiclePredictions(
             frame.lanes, frame.road_polygons, detections, tracks, pred_cfg);
