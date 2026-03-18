@@ -138,6 +138,89 @@ bool findLookaheadPoint(const LanePolyline& lane,
     return true;
 }
 
+double computeRemainingDistanceToLaneEnd(
+    const LanePolyline& lane,
+    const LaneProjectionResult& proj)
+{
+    if (!proj.valid || lane.points.size() < 2) {
+        return std::numeric_limits<double>::infinity();
+    }
+    int i = proj.seg_idx;
+    if (i < 0 || i + 1 >= static_cast<int>(lane.points.size())) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    double remain = 0.0;
+    double sx = proj.nearest_x;
+    double sy = proj.nearest_y;
+    while (i + 1 < static_cast<int>(lane.points.size())) {
+        double ex = lane.points[i + 1].x;
+        double ey = lane.points[i + 1].y;
+        remain += std::hypot(ex - sx, ey - sy);
+        i++;
+        if (i + 1 >= static_cast<int>(lane.points.size())) break;
+        sx = lane.points[i].x;
+        sy = lane.points[i].y;
+    }
+    return remain;
+}
+
+double computeLocalAvgAbsKappa(
+    const LanePolyline& lane,
+    const LaneProjectionResult& proj,
+    double window_m)
+{
+    if (!proj.valid || lane.points.size() < 2 || window_m <= 0.0) return 0.0;
+    if (proj.seg_idx < 0 || proj.seg_idx + 1 >= static_cast<int>(lane.points.size())) return 0.0;
+
+    const auto& p0 = lane.points[proj.seg_idx];
+    const auto& p1 = lane.points[proj.seg_idx + 1];
+    const double kappa_proj = p0.kappa + proj.seg_t * (p1.kappa - p0.kappa);
+    auto avgAbsKappaBackward = [&]() {
+        double sum_abs_kappa = std::fabs(kappa_proj);
+        int cnt = 1;
+        double rem = window_m;
+        double cx = proj.nearest_x;
+        double cy = proj.nearest_y;
+        for (int i = proj.seg_idx; i >= 0 && rem > 0.0; --i) {
+            const double nx = lane.points[i].x;
+            const double ny = lane.points[i].y;
+            const double ds = std::hypot(nx - cx, ny - cy);
+            if (ds < 1e-6) continue;
+            rem -= ds;
+            sum_abs_kappa += std::fabs(lane.points[i].kappa);
+            cnt++;
+            cx = nx;
+            cy = ny;
+        }
+        return (cnt > 0) ? (sum_abs_kappa / static_cast<double>(cnt)) : 0.0;
+    };
+
+    auto avgAbsKappaForward = [&]() {
+        double sum_abs_kappa = std::fabs(kappa_proj);
+        int cnt = 1;
+        double rem = window_m;
+        double cx = proj.nearest_x;
+        double cy = proj.nearest_y;
+        for (int i = proj.seg_idx + 1; i < static_cast<int>(lane.points.size()) && rem > 0.0; ++i) {
+            const double nx = lane.points[i].x;
+            const double ny = lane.points[i].y;
+            const double ds = std::hypot(nx - cx, ny - cy);
+            if (ds < 1e-6) continue;
+            rem -= ds;
+            sum_abs_kappa += std::fabs(lane.points[i].kappa);
+            cnt++;
+            cx = nx;
+            cy = ny;
+        }
+        return (cnt > 0) ? (sum_abs_kappa / static_cast<double>(cnt)) : 0.0;
+    };
+
+    const double avg_back = avgAbsKappaBackward();
+    const double avg_front = avgAbsKappaForward();
+    return std::max(avg_back, avg_front);
+}
+
 LaneChoiceResult chooseReferenceLane(
     const std::vector<LanePolyline>& lanes,
     double x,
@@ -152,7 +235,7 @@ LaneChoiceResult chooseReferenceLane(
     const LanePolyline* nearest_lane = nullptr;
     double nearest_score = std::numeric_limits<double>::infinity();
     const double MAX_DIST = 8.0;
-    const double MAX_HEADING_DIFF = M_PI * 0.5;  // 90 deg
+    const double MAX_HEADING_DIFF = M_PI * 0.25;  // 45 deg
 
     const LanePolyline* left_lane = nullptr;
     double left_dist = std::numeric_limits<double>::infinity();
@@ -292,7 +375,8 @@ LanePolyline stitchLaneByNearestEndpoint(
     double min_ref_length_m,
     double max_join_dist_m,
     std::vector<std::string>* stitched_tokens = nullptr,
-    std::vector<double>* stitch_join_dists_m = nullptr)
+    std::vector<double>* stitch_join_dists_m = nullptr,
+    std::vector<int>* stitch_joint_indices = nullptr)
 {
     LanePolyline merged = base_lane;
     merged.length_m = computePolylineLength(merged);
@@ -302,6 +386,9 @@ LanePolyline stitchLaneByNearestEndpoint(
     }
     if (stitch_join_dists_m != nullptr) {
         stitch_join_dists_m->clear();
+    }
+    if (stitch_joint_indices != nullptr) {
+        stitch_joint_indices->clear();
     }
     if (merged.length_m >= min_ref_length_m || merged.points.size() < 2) {
         return merged;
@@ -331,6 +418,9 @@ LanePolyline stitchLaneByNearestEndpoint(
         used_tokens.insert(best_next->token);
         if (stitched_tokens != nullptr) stitched_tokens->push_back(best_next->token);
         if (stitch_join_dists_m != nullptr) stitch_join_dists_m->push_back(best_dist);
+        if (stitch_joint_indices != nullptr) {
+            stitch_joint_indices->push_back(static_cast<int>(merged.points.size()) - 1);
+        }
 
         //在拼接相邻车道时，如果首尾重叠，就跳过重复的第一个点。
         size_t start_idx = 0;
@@ -345,6 +435,80 @@ LanePolyline stitchLaneByNearestEndpoint(
     }
 
     return merged;
+}
+
+void smoothLaneYawKappaAtJoints(
+    LanePolyline& lane,
+    const std::vector<int>& stitch_joint_indices,
+    int half_window_points = 10)
+{
+    if (lane.points.size() < 3 || stitch_joint_indices.empty()) return;
+    const int n = static_cast<int>(lane.points.size());
+    const int w = std::max(1, half_window_points);
+
+    for (int j : stitch_joint_indices) {
+        if (j < 0 || j >= n) continue;
+        const int l = std::max(0, j - w);
+        const int r = std::min(n - 1, j + w);
+        if (r - l < 2) continue;
+
+        const double yaw_l = lane.points[l].yaw;
+        const double yaw_r = lane.points[r].yaw;
+        const double k_l = lane.points[l].kappa;
+        const double k_r = lane.points[r].kappa;
+
+        for (int i = l; i <= r; i++) {
+            const double t = static_cast<double>(i - l) /
+                             static_cast<double>(r - l);
+            lane.points[i].yaw = normalizeAngle(
+                yaw_l + t * normalizeAngle(yaw_r - yaw_l));
+            lane.points[i].kappa = (1.0 - t) * k_l + t * k_r;
+        }
+    }
+}
+
+LanePolyline buildLaneFromProjection(
+    const LanePolyline& lane,
+    double x,
+    double y,
+    double yaw)
+{
+    LanePolyline out;
+    out.token = lane.token;
+    if (lane.points.size() < 2) return out;
+
+    LaneProjectionResult proj = projectPointToLane(lane, x, y, yaw);
+    if (!proj.valid) return out;
+    if (proj.seg_idx < 0 ||
+        proj.seg_idx + 1 >= static_cast<int>(lane.points.size())) return out;
+
+    const auto& p0 = lane.points[proj.seg_idx];
+    const auto& p1 = lane.points[proj.seg_idx + 1];
+    LanePolyline::Point start;
+    start.x = proj.nearest_x;
+    start.y = proj.nearest_y;
+    start.yaw = normalizeAngle(
+        p0.yaw + proj.seg_t * normalizeAngle(p1.yaw - p0.yaw));
+    if (!std::isfinite(start.yaw)) {
+        start.yaw = std::atan2(p1.y - p0.y, p1.x - p0.x);
+    }
+    start.kappa = p0.kappa + proj.seg_t * (p1.kappa - p0.kappa);
+    out.points.push_back(start);
+
+    for (size_t i = static_cast<size_t>(proj.seg_idx) + 1;
+         i < lane.points.size(); i++) {
+        out.points.push_back(lane.points[i]);
+    }
+
+    if (out.points.size() >= 2) {
+        const double d01 = std::hypot(out.points[1].x - out.points[0].x,
+                                      out.points[1].y - out.points[0].y);
+        if (d01 < 1e-4) {
+            out.points.erase(out.points.begin() + 1);
+        }
+    }
+    out.length_m = computePolylineLength(out);
+    return out;
 }
 
 PredTrajectory predictSingleTrack(const TrackKinematicState& track,
@@ -365,6 +529,10 @@ PredTrajectory predictSingleTrack(const TrackKinematicState& track,
     double v = std::max(0.0, track.v);
     double a_track = clampValue(track.accel, -6.0, 3.5);
     double yaw_rate_track = clampValue(track.yaw_rate, -1.2, 1.2);
+    const char* model_str = (track.mode_idx == 0) ? "CV" :
+                            (track.mode_idx == 1) ? "CTRV" :
+                            (track.mode_idx == 3) ? "CA" :
+                            (track.mode_idx == 2) ? "RM" : "UNK";
 
     pcl::PointXYZ p0;
     p0.x = static_cast<float>(x);
@@ -372,91 +540,93 @@ PredTrajectory predictSingleTrack(const TrackKinematicState& track,
     p0.z = 0.15f;
     out.points.push_back(p0);
 
-    // Prefer staying on one line; reselect only when we lose it.
-    LaneChoiceResult active_choice = chooseReferenceLane(
+    // Fixed reference line: choose at t0 and keep it for the full horizon.
+    LaneChoiceResult init_choice = chooseReferenceLane(
         lanes, x, y, yaw, track.mode_idx, yaw_rate_track);
-    LanePolyline stitched_lane;
-    const LanePolyline* active_lane = nullptr;
-    auto appendSelectedToken = [&](const std::string& token) {
-        if (token.empty()) return;
-        if (std::find(out.selected_lane_tokens.begin(),
-                      out.selected_lane_tokens.end(),
-                      token) == out.selected_lane_tokens.end()) {
-            out.selected_lane_tokens.push_back(token);
-        }
-    };
-    auto updateActiveLane = [&](const LanePolyline* base_lane,
-                                const char* stage_tag,
-                                int step_idx,
-                                bool enable_log) -> bool {
-        if (base_lane == nullptr) {
-            if (enable_log) {
-                ROS_INFO_STREAM("[PredLane] track=" << track.track_id
-                                << " step=" << step_idx
-                                << " stage=" << stage_tag
-                                << " selected_lane_token=<none>");
-            }
-            return false;
-        }
-        if (enable_log) {
-            ROS_INFO_STREAM("[PredLane] track=" << track.track_id
-                            << " step=" << step_idx
-                            << " stage=" << stage_tag
-                            << " selected_lane_token=" << base_lane->token);
-        }
-        appendSelectedToken(base_lane->token);
-        if (computePolylineLength(*base_lane) >= cfg.min_ref_length_m) {
-            active_lane = base_lane;
-            return true;
-        }
-        std::vector<std::string> stitched_tokens;
-        std::vector<double> stitch_join_dists_m;
-        stitched_lane = stitchLaneByNearestEndpoint(
-            *base_lane, lanes, cfg.min_ref_length_m, cfg.stitch_max_gap_m,
-            &stitched_tokens, &stitch_join_dists_m);
-        active_lane = &stitched_lane;
-        for (const auto& tok : stitched_tokens) appendSelectedToken(tok);
+    if (init_choice.lane == nullptr) {
+        ROS_INFO_STREAM("[PredLane] track=" << track.track_id
+                        << " model=" << model_str
+                        << " selected_lane_token=<none>");
+        return out;
+    }
 
-        std::ostringstream chain_ss;
-        for (size_t i = 0; i < stitched_tokens.size(); i++) {
-            if (i > 0) chain_ss << " -> ";
-            chain_ss << stitched_tokens[i];
+    ROS_INFO_STREAM("[PredLane] track=" << track.track_id
+                    << " model=" << model_str
+                    << " selected_lane_token="
+                    << init_choice.lane->token);
+
+    LanePolyline fixed_lane = buildLaneFromProjection(*init_choice.lane, x, y, yaw);
+    if (fixed_lane.points.size() < 2) return out;
+    const bool short_lane_mode = (fixed_lane.length_m + 1e-6 < cfg.min_ref_length_m);
+    const double end_stop_margin_m = 0.8;
+    const double end_target_buffer_m = 0.3;
+    const double kappa_avg_window_m = 8.0;
+    const double kappa_lookahead_gain = 12.0;
+
+    std::vector<std::string> stitched_tokens{fixed_lane.token};
+    std::vector<double> stitch_join_dists_m;
+    std::vector<int> stitch_joint_indices;
+    if (fixed_lane.length_m < cfg.min_ref_length_m) {
+        fixed_lane = stitchLaneByNearestEndpoint(
+            fixed_lane, lanes, cfg.min_ref_length_m, cfg.stitch_max_gap_m,
+            &stitched_tokens, &stitch_join_dists_m, &stitch_joint_indices);
+        smoothLaneYawKappaAtJoints(fixed_lane, stitch_joint_indices, 10);
+        fixed_lane.length_m = computePolylineLength(fixed_lane);
+    }
+    if (fixed_lane.points.size() < 2) return out;
+
+    out.selected_lane_tokens.clear();
+    for (const auto& tok : stitched_tokens) {
+        if (!tok.empty() &&
+            std::find(out.selected_lane_tokens.begin(),
+                      out.selected_lane_tokens.end(),
+                      tok) == out.selected_lane_tokens.end()) {
+            out.selected_lane_tokens.push_back(tok);
         }
-        std::ostringstream dist_ss;
-        for (size_t i = 0; i < stitch_join_dists_m.size(); i++) {
-            if (i > 0) dist_ss << ", ";
-            dist_ss << stitch_join_dists_m[i];
-        }
-        if (enable_log) {
-            ROS_INFO_STREAM("[PredLane] track=" << track.track_id
-                            << " step=" << step_idx
-                            << " stage=" << stage_tag
-                            << " stitch_chain=" << chain_ss.str()
-                            << " stitch_join_dist_m=[" << dist_ss.str() << "]"
-                            << " merged_len_m=" << active_lane->length_m);
-        }
-        return active_lane->points.size() >= 2;
-    };
-    if (!updateActiveLane(active_choice.lane, "init", 0, true)) return out;
+    }
+
+    std::ostringstream chain_ss;
+    for (size_t i = 0; i < stitched_tokens.size(); i++) {
+        if (i > 0) chain_ss << " -> ";
+        chain_ss << stitched_tokens[i];
+    }
+    std::ostringstream dist_ss;
+    for (size_t i = 0; i < stitch_join_dists_m.size(); i++) {
+        if (i > 0) dist_ss << ", ";
+        dist_ss << stitch_join_dists_m[i];
+    }
+    ROS_INFO_STREAM("[PredLane] track=" << track.track_id
+                    << " model=" << model_str
+                    << " stitch_chain=" << chain_ss.str()
+                    << " stitch_join_dist_m=[" << dist_ss.str() << "]"
+                    << " merged_len_m=" << fixed_lane.length_m);
 
     for (int k = 0; k < n_steps; k++) {
-        if (active_lane == nullptr) break;
+        LaneProjectionResult proj = projectPointToLane(fixed_lane, x, y, yaw);
+        if (!proj.valid) break;
 
-        LaneProjectionResult proj = projectPointToLane(*active_lane, x, y, yaw);
-        if (!proj.valid || proj.dist > 4.5) {
-            std::string prev_token = active_lane->token;
-            active_choice = chooseReferenceLane(
-                lanes, x, y, yaw, track.mode_idx, yaw_rate_track);
-            bool lane_changed = (active_choice.lane != nullptr &&
-                                 active_choice.lane->token != prev_token);
-            if (!updateActiveLane(active_choice.lane, "reselect", k, lane_changed)) break;
-            proj = projectPointToLane(*active_lane, x, y, yaw);
-            if (!proj.valid) break;
+        const double remain_to_end = computeRemainingDistanceToLaneEnd(fixed_lane, proj);
+        if (short_lane_mode && remain_to_end <= end_stop_margin_m) {
+            pcl::PointXYZ pend;
+            pend.x = static_cast<float>(fixed_lane.points.back().x);
+            pend.y = static_cast<float>(fixed_lane.points.back().y);
+            pend.z = 0.15f;
+            if (out.points.empty() ||
+                std::hypot(out.points.back().x - pend.x, out.points.back().y - pend.y) > 0.1) {
+                out.points.push_back(pend);
+            }
+            break;
         }
 
-        double lookahead = clampValue(2.5 + 0.5 * v, 3.0, 12.0);
+        const double avg_abs_kappa = computeLocalAvgAbsKappa(
+            fixed_lane, proj, kappa_avg_window_m);
+        const double lookahead_raw = 2.5 + 0.5 * v - kappa_lookahead_gain * avg_abs_kappa;
+        double lookahead = clampValue(lookahead_raw, 2.0, 12.0);
+        if (short_lane_mode && std::isfinite(remain_to_end)) {
+            lookahead = std::min(lookahead, std::max(remain_to_end - end_target_buffer_m, 0.3));
+        }
         double lx = x, ly = y;
-        if (!findLookaheadPoint(*active_lane, proj, lookahead, lx, ly)) break;
+        if (!findLookaheadPoint(fixed_lane, proj, lookahead, lx, ly)) break;
 
         // Lateral pure pursuit, blended with tracked yaw-rate.
         double heading_to_ref = atan2(ly - y, lx - x);
@@ -466,7 +636,8 @@ PredTrajectory predictSingleTrack(const TrackKinematicState& track,
         double cte = proj.lateral_sign * proj.dist;
         double yaw_rate_cte = clampValue(0.45 * cte, -0.6, 0.6);
         double yaw_rate_lane = yaw_rate_pp + yaw_rate_cte;
-        double w_track = (track.mode_idx == 1) ? 0.55 : 0.25;
+        // Keep CTRV lane-following aggressiveness consistent with CV.
+        double w_track = 0.25;
         if (std::fabs(cte) > 1.5) {
             w_track *= 0.5;
         }

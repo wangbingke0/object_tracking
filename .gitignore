@@ -8,6 +8,5 @@ __pycache__/
 .vscode/
 v1.0-*/
 backup/
-pic/
 file/
-
+nuscenes_preprocessed/
